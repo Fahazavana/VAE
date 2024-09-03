@@ -51,9 +51,8 @@ def get_device():
 class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
-        self.embed = nn.Embedding(10, 28 * 28)
         self.encoder = nn.Sequential(
-            nn.Conv2d(1 + 1, 128, 3, 2, 1),
+            nn.Conv2d(1, 128, 3, 2, 1),
             nn.BatchNorm2d(128),
             nn.GELU(),
             nn.Conv2d(128, 128, 3, 2, 1),
@@ -70,18 +69,27 @@ class Encoder(nn.Module):
         self.z_mean = nn.Linear(512, 200)
         self.z_log_var = nn.Linear(512, 200)
 
-    def forward(self, x, y):
-        y = self.embed(y).view(-1, 1, 28, 28)
-        x = torch.cat((x, y), dim=1)
+    def forward(self, x):
         x = self.encoder(x)
         z_mean = self.z_mean(x)
         z_log_var = self.z_log_var(x)
         return z_mean, z_log_var
 
 
-summary(
-    Encoder(), input_data=[torch.rand((8, 1, 28, 28)), torch.randint(10, (8, 1)).long()]
-)
+summary(Encoder(), input_data=torch.rand((8, 1, 28, 28)))
+
+
+# %% [markdown]
+# ## Classifier
+
+# %%
+class Classifier(nn.Module):
+    def __init__(self):
+        super(Classifier, self).__init__()
+        self.classifier = nn.Sequential(nn.Linear(200, 64), nn.Linear(64, 10))
+
+    def forward(self, x):
+        return self.classifier(x)
 
 
 # %% [markdown]
@@ -121,7 +129,7 @@ class Decoder(nn.Module):
             nn.BatchNorm2d(128),
             nn.GELU(),
             nn.ConvTranspose2d(128, 1, 3, 2, 1, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -132,18 +140,18 @@ summary(Decoder(), input_data=torch.rand((4, 200)))
 
 
 # %% [markdown]
-# ## CVAE
+# ## VAE
 
 # %%
-class CVAE(nn.Module):
+class VAE(nn.Module):
     def __init__(self):
-        super(CVAE, self).__init__()
+        super(VAE, self).__init__()
         self.encoder = Encoder()
         self.decoder = Decoder()
         self.sampler = Sampling()
 
-    def forward(self, x, y):
-        z_mean, z_log_var = self.encoder(x, y)
+    def forward(self, x):
+        z_mean, z_log_var = self.encoder(x)
         z = self.sampler((z_mean, z_log_var))
         x_hat = self.decoder(z)
         return z_mean, z_log_var, x_hat
@@ -161,11 +169,13 @@ class KLDiv(nn.Module):
 
 # %%
 device = get_device()
-cvae_model = CVAE().to(device)
+vae_model = VAE().to(device)
+classifier = Classifier().to(device)
 
 # %%
-optimizer = torch.optim.Adam(cvae_model.parameters())
+optimizer = torch.optim.Adam(vae_model.parameters())
 reconstruction_loss = nn.MSELoss()
+classifier_loss = nn.CrossEntropyLoss()
 kl_divergence = KLDiv()
 epochs = 10
 
@@ -174,11 +184,11 @@ train_loader = DataLoader(mnist_data, batch_size=512, shuffle=True)
 
 # %%
 loss_tracker = []
-cvae_model.train()
+vae_model.train()
 N = len(train_loader.dataset)
 fixed_z = torch.randn(10, 200).to(device)
 with torch.no_grad():
-    x_hat = cvae_model.decoder(fixed_z)
+    x_hat = vae_model.decoder(fixed_z)
 x_hat_grid = make_grid(x_hat, nrow=10)
 fig, ax = plt.subplots(1, 1, figsize=(10, 5))
 ax.imshow(x_hat_grid.cpu().permute(1, 2, 0))
@@ -187,23 +197,36 @@ plt.tight_layout()
 plt.show()
 for epoch in range(epochs):
     t_loss = 0
+    trec = 0
+    tkl = 0
+    tcl = 0
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=True)
     for image, label in pbar:
         image = image.to(device)
         label = label.to(device)
-        z_mean, z_log_var, x_hat = cvae_model(image, label)
+        z_mean, z_log_var, x_hat = vae_model(image)
+        mean_class = classifier(z_mean)
+        class_loss = classifier_loss(mean_class, label)
         rec_loss = reconstruction_loss(image, x_hat)
         kl_div = kl_divergence(z_mean, z_log_var)
-        loss = 500*rec_loss + kl_div
+        loss = 500* rec_loss + kl_div + class_loss
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        trec += rec_loss.item() * image.size(0)
+        tkl += kl_div.item() * image.size(0)
+        tcl += class_loss * image.size(0)
         t_loss += loss.item() * image.size(0)
-        pbar.set_postfix(loss=f"{t_loss/N:.3f}")
+        pbar.set_postfix(
+            Tloss=f"{t_loss/N:.3f}",
+            rec=f"{trec/N:.3f}",
+            KL=f"{tkl/N:.3f}",
+            tcl=f"{tcl/N:.3f}",
+        )
     t_loss = t_loss / N
     loss_tracker.append(t_loss)
     with torch.no_grad():
-        x_hat = cvae_model.decoder(fixed_z)
+        x_hat = vae_model.decoder(fixed_z)
     x_hat_grid = make_grid(x_hat, nrow=10)
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     ax.imshow(x_hat_grid.cpu().permute(1, 2, 0))
@@ -212,13 +235,10 @@ for epoch in range(epochs):
     plt.show()
 
 # %%
-image, label = next(iter(train_loader))
-
-# %%
 with torch.no_grad():
     image = image.to(device)
     label = label.to(device)
-    z_mean, z_log_var, x_hat = cvae_model(image, label)
+    z_mean, z_log_var, x_hat = vae_model(image)
 
 indices = torch.randint(0, x_hat.size(0), (100,))
 x_hat_subset = x_hat[indices]
@@ -243,8 +263,8 @@ plt.show()
 
 # %%
 with torch.no_grad():
-    z = torch.randn(100, 200).to(device) 
-    x_hat = cvae_model.decoder(z)
+    z = torch.randn(100, 200).to(device)
+    x_hat = vae_model.decoder(z)
     indices = torch.randint(0, x_hat.size(0), (100,))
     x_hat_subset = x_hat[indices]
 
@@ -259,10 +279,10 @@ plt.show()
 
 # %%
 with torch.no_grad():
-    latent_range = (-10,10)
+    latent_range = (-10, 10)
     z = torch.rand(100, 200) * (latent_range[1] - latent_range[0]) + latent_range[0]
     z = z.to(device)
-    x_hat = cvae_model.decoder(z)
+    x_hat = vae_model.decoder(z)
 x_hat_grid = make_grid(x_hat, nrow=10)
 
 fig, ax = plt.subplots(1, 1, figsize=(10, 5))
